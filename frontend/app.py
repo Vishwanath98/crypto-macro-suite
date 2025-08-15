@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Any, Dict, List
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,13 +12,13 @@ import streamlit as st
 st.set_page_config(page_title="Crypto Macro (Free)", page_icon="📊", layout="wide")
 UTC = timezone.utc
 
-# Backend base URL (set this in Streamlit Secrets)
+# Backend base URL (set this in Streamlit Secrets or env)
 BACKEND = st.secrets.get("BACKEND_URL", os.environ.get("BACKEND_URL", ""))
 if not BACKEND:
-    st.warning("Set BACKEND_URL in Streamlit Secrets to enable backend-powered charts.")
+    st.warning("Set BACKEND_URL in Streamlit Secrets (or env) to enable backend-powered charts.")
 
 # --------------------------
-# HTTP helper (cached GET)
+# HTTP helpers
 # --------------------------
 @st.cache_data(show_spinner=False)
 def jget(url: str, params: Optional[dict] = None, retries: int = 2):
@@ -38,6 +38,44 @@ def jget(url: str, params: Optional[dict] = None, retries: int = 2):
             last = {"_error": str(e), "_url": url}
             time.sleep(0.3 * (2 ** i))
     return last or {}
+
+def _to_list(payload: Any) -> List[Dict[str, Any]]:
+    """
+    Normalize a backend response to a list-of-dicts for pandas.
+    Returns [] on any error-ish payload.
+    """
+    # Already a list?
+    if isinstance(payload, list):
+        # must be list of dicts (Binance style); otherwise bail
+        return payload if (not payload or isinstance(payload[0], dict)) else []
+    # Dict error shapes: our backend uses {"_error": "..."}; Binance uses {"code": -X, "msg":"..."}
+    if isinstance(payload, dict):
+        if payload.get("_error") is not None:
+            return []
+        if "code" in payload and payload.get("code") not in (None, 0, "0"):
+            return []
+        # Some APIs return {"data":[...]} or {"rows":[...]}
+        for k in ("data", "rows", "result", "list", "series"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return v
+        # Otherwise it's a single object — wrap it if it has multiple fields
+        return [payload] if payload else []
+    # Anything else -> []
+    return []
+
+def bget(path: str, params: Optional[dict] = None) -> List[Dict[str, Any]]:
+    """
+    Call the backend and always return a list for DataFrame creation.
+    If the backend returned an error dict, show a tiny warning and return [].
+    """
+    if not BACKEND:
+        return []
+    js = jget(f"{BACKEND}{path}", params or {})
+    if isinstance(js, dict) and js.get("_error"):
+        st.warning(f"Backend error at {path}: {js.get('_error')}")
+        return []
+    return _to_list(js)
 
 # --------------------------
 # Spot OHLC (free fallbacks)
@@ -140,6 +178,27 @@ with t_macro:
             st.plotly_chart(px.line(df, x="t", y="btc_dom", title="BTC Dominance (%)"), use_container_width=True)
 
 # ---- Derivatives ----
+def tsify(rows: Any) -> pd.DataFrame:
+    """Safe DataFrame builder that tolerates error payloads and varying time keys."""
+    rows = _to_list(rows)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    for k in ("timestamp", "time", "T"):
+        if k in df.columns:
+            # Tolerate strings, ints, etc.
+            try:
+                df["t"] = pd.to_datetime(pd.to_numeric(df[k], errors="coerce"), unit="ms", utc=True)
+            except Exception:
+                try:
+                    df["t"] = pd.to_datetime(df[k], unit="ms", utc=True)
+                except Exception:
+                    pass
+            break
+    return df
+
 with t_derivs:
     st.subheader("Spot Price, OI, Long/Short, Taker Flow (Free Public Endpoints via Backend)")
     for sym in symbols:
@@ -175,26 +234,14 @@ with t_derivs:
         else:
             st.info("No spot OHLC available right now (Binance/Kraken/Bitstamp all blocked or empty).")
 
-        oi = jget(
-            f"{BACKEND}/derivs/oi_hist", {"symbol": sym, "period": deriv_period, "limit": 500}
-        ) if BACKEND else []
-        ls = jget(
-            f"{BACKEND}/derivs/ls_ratio", {"symbol": sym, "period": deriv_period, "limit": 500}
-        ) if BACKEND else []
-        tk = jget(
-            f"{BACKEND}/derivs/taker_ratio", {"symbol": sym, "period": deriv_period, "limit": 500}
-        ) if BACKEND else []
-
-        def tsify(d):
-            df = pd.DataFrame(d)
-            for k in ("timestamp", "time", "T"):
-                if k in df:
-                    df["t"] = pd.to_datetime(df[k], unit="ms", utc=True)
-            return df
+        # --- Derivatives via backend (robust) ---
+        oi = bget("/derivs/oi_hist", {"symbol": sym, "period": deriv_period, "limit": 500})
+        ls = bget("/derivs/ls_ratio", {"symbol": sym, "period": deriv_period, "limit": 500})
+        tk = bget("/derivs/taker_ratio", {"symbol": sym, "period": deriv_period, "limit": 500})
 
         dfo, dfl, dft = (tsify(oi), tsify(ls), tsify(tk))
 
-        if not dfo.empty and "sumOpenInterestValue" in dfo:
+        if not dfo.empty and "sumOpenInterestValue" in dfo.columns:
             st.plotly_chart(
                 px.area(dfo, x="t", y="sumOpenInterestValue", title=f"{sym} OI Notional (USD)"),
                 use_container_width=True,
@@ -218,11 +265,11 @@ with t_derivs:
     st.subheader("Aggregated OI (Binance + Bybit + OKX)")
     for sym in symbols:
         js = jget(f"{BACKEND}/agg/oi", {"symbol": sym}) if BACKEND else {}
-        rows = js.get("exchanges", [])
+        rows = (js or {}).get("exchanges", [])
         if rows:
             st.dataframe(pd.DataFrame(rows))
         series = jget(f"{BACKEND}/agg/oi_series", {"symbol": sym, "bucket": "daily", "days": 60}) if BACKEND else {}
-        srf = pd.DataFrame(series.get("series", []))
+        srf = pd.DataFrame((series or {}).get("series", []))
         if not srf.empty:
             srf["t"] = pd.to_datetime(srf["t"], unit="ms", utc=True)
             st.plotly_chart(px.line(srf, x="t", y="oi_usd", title=f"{sym} Aggregated OI Notional (USD)"), use_container_width=True)
@@ -231,7 +278,6 @@ with t_derivs:
 with t_liq:
     st.subheader("Live Liquidations Heatmap (Backend buffer from Binance !forceOrder@arr)")
     sym = st.selectbox("Symbol", symbols, index=0)
-    # 👉 use 'liq_minutes' from the sidebar, not session_state
     js = jget(
         f"{BACKEND}/liq/heatmap", {"symbol": sym, "minutes": liq_minutes, "bins": bins}
     ) if BACKEND else {"x": [], "y": [], "z": []}
