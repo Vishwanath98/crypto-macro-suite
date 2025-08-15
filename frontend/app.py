@@ -135,19 +135,32 @@ def binance_klines(symbol: str, interval: str, start: int, end: int, limit: int 
     ])
 
 
-def binance_open_interest_hist(symbol: str, period: str = "1h", start: Optional[int] = None, end: Optional[int] = None) -> pd.DataFrame:
+def binance_open_interest_hist(
+    symbol: str,
+    period: str = "1h",
+    start: Optional[int] = None,
+    end: Optional[int] = None
+) -> pd.DataFrame:
     base = os.environ.get("BINANCE_FAPI", BINANCE_FAPI)
     url = f"{base}/futures/data/openInterestHist"
     params = {"symbol": symbol, "period": period, "limit": 500}
     if start: params["startTime"] = start
     if end: params["endTime"] = end
-    data = _fetch_json(url, params=params, ttl=0)
-    df = pd.DataFrame(data)
-    if df.empty: return df
+
+    js = _fetch_json(url, params=params, ttl=0)
+
+    # ✅ Robust guards: if blocked or empty, return an empty DataFrame
+    if not isinstance(js, list) or not js:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(js)
     for c in ["sumOpenInterestValue", "sumOpenInterest"]:
-        if c in df: df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "timestamp" in df: df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "timestamp" in df:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df
+
 
 def binance_open_interest_now(symbol: str) -> Optional[float]:
     try:
