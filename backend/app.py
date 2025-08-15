@@ -8,7 +8,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.services.ws_liq import RUN_WS, start_liq_buffer, get_heatmap
+from services.ws_liq import RUN_WS, start_liq_buffer, get_heatmap   # CHANGED
 
 BACKEND_LOG_LEVEL = os.getenv("BACKEND_LOG_LEVEL", "info").lower()
 
