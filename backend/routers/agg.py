@@ -9,6 +9,9 @@ from services.providers import binance_oi_usd_latest, bybit_oi_usd_latest, okx_o
 
 router = APIRouter(prefix="/agg", tags=["aggregate"])
 UTC = timezone.utc
+@router.get("/snapshot")
+def snapshot_get(symbols: str = "BTCUSDT,ETHUSDT"):
+    return snapshot(symbols)
 
 @router.post("/snapshot")
 def snapshot(symbols: str = "BTCUSDT,ETHUSDT"):
@@ -60,4 +63,5 @@ def oi_series(symbol: str = "BTCUSDT", bucket: str = "daily", days: int = 60):
     sr = total.resample(rule).last().dropna()
     if days: sr = sr.iloc[-days:]
     out = [{"t": int(t.timestamp()*1000), "oi_usd": float(v)} for t,v in sr.items()]
+
     return {"symbol": symbol, "bucket": bucket, "series": out}
