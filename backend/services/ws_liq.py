@@ -6,7 +6,14 @@ from .db import _conn
 RUN_WS = os.getenv("RUN_WS", "1") == "1"      # default: on
 WS_URL = os.getenv("BINANCE_LIQ_WS",
                    "wss://fstream.binance.com/stream?streams=!forceOrder@arr")
+_worker_started = False
 
+def start_liq_buffer():
+    global _worker_started
+    if _worker_started:
+        return
+    _worker_started = True
+  
 def _save_event(ev):
     # ev is the "o" payload from Binance forceOrder
     try:
