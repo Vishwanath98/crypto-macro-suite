@@ -32,10 +32,34 @@ DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 st.set_page_config(page_title="Crypto Macro Dashboard", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
 @st.cache_data(show_spinner=False)
-def _fetch_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, ttl: int = 60) -> dict:
-    r = requests.get(url, params=params, headers=headers, timeout=15)
-    r.raise_for_status()
-    return r.json()
+def _fetch_json(
+    url: str,
+    params: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    ttl: int = 60,
+    retries: int = 2,
+    backoff: float = 0.6,
+) -> dict:
+    """HTTP GET with retries and gentle handling for 403/418/451 (common on Streamlit Cloud)."""
+    hdrs = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    if headers:
+        hdrs.update(headers)
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, headers=hdrs, timeout=15)
+            if r.status_code in (403, 418, 451):
+                # Return a soft error payload; callers should handle this gracefully.
+                return {"_error": f"http_{r.status_code}", "_url": url}
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff * (2**i))
+    return {"_error": str(last_err), "_url": url}
 
 def human_fmt(num) -> str:
     try:
@@ -57,20 +81,63 @@ def coingecko_coin_snap(ids: List[str]) -> pd.DataFrame:
     return pd.DataFrame(_fetch_json(f"{COINGECKO_API}/coins/markets", params=params, ttl=60))
 
 def binance_klines(symbol: str, interval: str, start: int, end: int, limit: int = 1000) -> pd.DataFrame:
-    url = f"{BINANCE_FAPI}/fapi/v1/klines"
+    """Try Binance Futures klines; fall back to continuous PERPETUAL klines, then spot klines."""
+    base = os.environ.get("BINANCE_FAPI", BINANCE_FAPI)
+
+    # 1) Futures klines
+    url = f"{base}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit, "startTime": start, "endTime": end}
     data = _fetch_json(url, params=params, ttl=0)
-    cols = ["open_time","open","high","low","close","volume","close_time","quote_asset_volume",
-            "number_of_trades","taker_buy_base","taker_buy_quote","ignore"]
-    df = pd.DataFrame(data, columns=cols)
-    for c in ["open","high","low","close","volume","quote_asset_volume","taker_buy_base","taker_buy_quote"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    return df
+    if isinstance(data, list) and data:
+        cols = ["open_time","open","high","low","close","volume","close_time","quote_asset_volume",
+                "number_of_trades","taker_buy_base","taker_buy_quote","ignore"]
+        df = pd.DataFrame(data, columns=cols)
+        for c in ["open","high","low","close","volume","quote_asset_volume","taker_buy_base","taker_buy_quote"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        return df
+
+    # 2) Continuous PERPETUAL (still futures)
+    url2 = f"{base}/fapi/v1/continuousKlines"
+    params2 = {"pair": symbol, "contractType": "PERPETUAL", "interval": interval, "limit": limit,
+               "startTime": start, "endTime": end}
+    data2 = _fetch_json(url2, params=params2, ttl=0)
+    if isinstance(data2, list) and data2:
+        cols = ["open_time","open","high","low","close","volume","close_time","quote_asset_volume",
+                "number_of_trades","taker_buy_base","taker_buy_quote","ignore"]
+        df = pd.DataFrame(data2, columns=cols)
+        for c in ["open","high","low","close","volume","quote_asset_volume","taker_buy_base","taker_buy_quote"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        return df
+
+    # 3) Spot fallback (keeps charts alive if futures blocked)
+    spot_url = "https://api.binance.com/api/v3/klines"
+    spot_params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000),
+                   "startTime": start, "endTime": end}
+    spot = _fetch_json(spot_url, params=spot_params, ttl=0)
+    if isinstance(spot, list) and spot:
+        cols = ["open_time","open","high","low","close","volume","close_time","quote_asset_volume",
+                "number_of_trades","taker_buy_base","taker_buy_quote","ignore"]
+        df = pd.DataFrame(spot, columns=cols)
+        for c in ["open","high","low","close","volume","quote_asset_volume","taker_buy_base","taker_buy_quote"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        return df
+
+    # Nothing worked → return an empty frame (no exception)
+    return pd.DataFrame(columns=[
+        "open_time","open","high","low","close","volume","close_time","quote_asset_volume",
+        "number_of_trades","taker_buy_base","taker_buy_quote","ignore"
+    ])
+
 
 def binance_open_interest_hist(symbol: str, period: str = "1h", start: Optional[int] = None, end: Optional[int] = None) -> pd.DataFrame:
-    url = f"{BINANCE_FAPI}/futures/data/openInterestHist"
+    base = os.environ.get("BINANCE_FAPI", BINANCE_FAPI)
+    url = f"{base}/futures/data/openInterestHist"
     params = {"symbol": symbol, "period": period, "limit": 500}
     if start: params["startTime"] = start
     if end: params["endTime"] = end
