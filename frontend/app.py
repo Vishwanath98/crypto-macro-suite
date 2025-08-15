@@ -15,16 +15,17 @@ import streamlit as st
 st.set_page_config(page_title="Crypto Macro (Free)", page_icon="📊", layout="wide")
 UTC = timezone.utc
 
-# Backend base URL (set this in Streamlit Secrets)
-BACKEND = st.secrets.get("BACKEND_URL", os.environ.get("BACKEND_URL", ""))
-if not BACKEND:
-    st.warning("Set BACKEND_URL in Streamlit Secrets to enable backend-powered charts.")
+# --------------------------
+# Backend base URL
+# --------------------------
+# Set BACKEND_URL in Streamlit Secrets or env. We strip trailing slashes to avoid '//' when building paths.
+BACKEND = (st.secrets.get("BACKEND_URL", os.environ.get("BACKEND_URL", "")) or "").rstrip("/")
 
 # --------------------------
-# HTTP helper (cached GET)
+# HTTP helpers (cached GET)
 # --------------------------
 @st.cache_data(show_spinner=False)
-def jget(url: str, params: Optional[dict] = None, retries: int = 2):
+def jget_abs(url: str, params: Optional[dict] = None, retries: int = 2):
     """GET JSON with simple retries + user-agent (helps with public APIs)."""
     ua = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     last = None
@@ -42,6 +43,20 @@ def jget(url: str, params: Optional[dict] = None, retries: int = 2):
             time.sleep(0.3 * (2 ** i))
     return last or {}
 
+def api_get(path: str, params: Optional[dict] = None, retries: int = 2):
+    """
+    Convenience wrapper to GET from the backend, e.g. api_get("/macro/series", {...})
+    Returns {} on missing BACKEND to simplify callers.
+    """
+    if not BACKEND:
+        return {"_error": "no_backend", "_url": path}
+    url = f"{BACKEND}{path if path.startswith('/') else '/' + path}"
+    return jget_abs(url, params=params, retries=retries)
+
+# Simple cache-clear button
+def clear_caches():
+    jget_abs.clear()
+
 # --------------------------
 # Spot OHLC (free fallbacks)
 # --------------------------
@@ -53,18 +68,16 @@ def spot_ohlc(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.Data
       3) Bitstamp      /api/v2/ohlc     (btcusdt / ethusdt)
     Returns DataFrame with columns: open_time, open, high, low, close, volume, close_time
     """
-    # map symbol to other venues
     pair = "BTCUSDT" if symbol.upper().startswith("BTC") else "ETHUSDT"
     kr_pair = "XBTUSD" if symbol.upper().startswith("BTC") else "ETHUSD"
     bs_pair = "btcusdt" if symbol.upper().startswith("BTC") else "ethusdt"
 
-    # granularity map
     gran = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "12h": 43200, "1d": 86400}
     g = gran.get(interval, 3600)
 
     # 1) Binance spot
     try:
-        js = jget(
+        js = jget_abs(
             "https://api.binance.com/api/v3/klines",
             {"symbol": pair, "interval": interval, "startTime": start_ms, "endTime": end_ms, "limit": 1000},
         )
@@ -81,7 +94,7 @@ def spot_ohlc(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.Data
 
     # 2) Kraken
     try:
-        js = jget("https://api.kraken.com/0/public/OHLC", {"pair": kr_pair, "interval": g // 60})
+        js = jget_abs("https://api.kraken.com/0/public/OHLC", {"pair": kr_pair, "interval": g // 60})
         data = (js.get("result") or {}).get(kr_pair, [])
         if isinstance(data, list) and data:
             # [time, open, high, low, close, vwap, volume, count]
@@ -96,7 +109,7 @@ def spot_ohlc(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.Data
 
     # 3) Bitstamp
     try:
-        js = jget(f"https://www.bitstamp.net/api/v2/ohlc/{bs_pair}/", {"step": g, "limit": 1000})
+        js = jget_abs(f"https://www.bitstamp.net/api/v2/ohlc/{bs_pair}/", {"step": g, "limit": 1000})
         data = (js.get("data") or {}).get("ohlc", [])
         if isinstance(data, list) and data:
             df = pd.DataFrame(data)
@@ -121,7 +134,30 @@ with st.sidebar:
     )
     liq_minutes = st.slider("Liq window (minutes)", 5, 120, 30)
     bins = st.slider("Heatmap bins", 20, 80, 50)
+
     st.caption("Backend URL: " + (BACKEND or "<not set>"))
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Clear cache", use_container_width=True):
+            clear_caches()
+            st.experimental_rerun()
+    with colB:
+        pass
+
+    # Backend health ping (if configured)
+    if BACKEND:
+        try:
+            t0 = time.perf_counter()
+            h = api_get("/health")  # should be cheap and public
+            dt = (time.perf_counter() - t0) * 1000
+            if isinstance(h, dict) or isinstance(h, list) or h:
+                st.success(f"Backend: OK ({dt:.0f} ms)")
+            else:
+                st.warning(f"Backend health returned empty ({dt:.0f} ms)")
+        except Exception as e:
+            st.error(f"Backend health error: {e}")
+    else:
+        st.warning("Set BACKEND_URL in Streamlit Secrets to enable backend-powered charts.")
 
 # ---------- Tabs ----------
 t_over, t_macro, t_derivs, t_liq = st.tabs(["Overview", "Macro", "Derivatives", "Liquidations"])
@@ -130,10 +166,13 @@ t_over, t_macro, t_derivs, t_liq = st.tabs(["Overview", "Macro", "Derivatives", 
 with t_macro:
     st.subheader("Market Caps & BTC Dominance (from snapshots)")
     rng = st.select_slider("Range (days)", [30, 90, 180, 365], value=180)
-    js = jget(f"{BACKEND}/macro/series", {"bucket": "daily", "days": rng}) if BACKEND else {"series": []}
+    js = api_get("/macro/series", {"bucket": "daily", "days": rng}) if BACKEND else {"series": []}
     df = pd.DataFrame(js.get("series", []))
     if df.empty:
-        st.info("No macro snapshots yet. On Render, run /macro/snapshot via cron or the provided GitHub Action.")
+        if js.get("_error") == "no_backend":
+            st.info("Backend not configured. Set BACKEND_URL in Secrets.")
+        else:
+            st.info("No macro snapshots yet. On your backend, schedule /macro/snapshot.")
     else:
         df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
         c1, c2 = st.columns([2, 1])
@@ -152,6 +191,18 @@ with t_macro:
 # ---- Derivatives (spot price + OI/ratios + aggregated OI) ----
 with t_derivs:
     st.subheader("Spot Price, OI, Long/Short, Taker Flow (Free Public Endpoints via Backend)")
+
+    def tsify(d):
+        df = pd.DataFrame(d)
+        if df.empty:
+            return df
+        for k in ("timestamp", "time", "T", "t"):
+            if k in df:
+                # assume ms
+                df["t"] = pd.to_datetime(df[k], unit="ms", utc=True)
+                break
+        return df
+
     for sym in symbols:
         st.markdown(f"### {sym}")
 
@@ -190,22 +241,9 @@ with t_derivs:
             st.info("No spot OHLC available right now (Binance/Kraken/Bitstamp all blocked or empty).")
 
         # --- Derivatives (Binance market-data endpoints proxied by backend) ---
-        oi = jget(
-            f"{BACKEND}/derivs/oi_hist", {"symbol": sym, "period": deriv_period, "limit": 500}
-        ) if BACKEND else []
-        ls = jget(
-            f"{BACKEND}/derivs/ls_ratio", {"symbol": sym, "period": deriv_period, "limit": 500}
-        ) if BACKEND else []
-        tk = jget(
-            f"{BACKEND}/derivs/taker_ratio", {"symbol": sym, "period": deriv_period, "limit": 500}
-        ) if BACKEND else []
-
-        def tsify(d):
-            df = pd.DataFrame(d)
-            for k in ("timestamp", "time", "T"):
-                if k in df:
-                    df["t"] = pd.to_datetime(df[k], unit="ms", utc=True)
-            return df
+        oi = api_get("/derivs/oi_hist", {"symbol": sym, "period": deriv_period, "limit": 500}) if BACKEND else []
+        ls = api_get("/derivs/ls_ratio", {"symbol": sym, "period": deriv_period, "limit": 500}) if BACKEND else []
+        tk = api_get("/derivs/taker_ratio", {"symbol": sym, "period": deriv_period, "limit": 500}) if BACKEND else []
 
         dfo, dfl, dft = (tsify(oi), tsify(ls), tsify(tk))
 
@@ -232,33 +270,55 @@ with t_derivs:
     st.divider()
     st.subheader("Aggregated OI (Binance + Bybit + OKX)")
     for sym in symbols:
-        js = jget(f"{BACKEND}/agg/oi", {"symbol": sym}) if BACKEND else {}
-        rows = js.get("exchanges", [])
+        js = api_get("/agg/oi", {"symbol": sym}) if BACKEND else {}
+        rows = js.get("exchanges", []) if isinstance(js, dict) else []
         if rows:
             st.dataframe(pd.DataFrame(rows))
-        series = jget(f"{BACKEND}/agg/oi_series", {"symbol": sym, "bucket": "daily", "days": 60}) if BACKEND else {}
+        series = api_get("/agg/oi_series", {"symbol": sym, "bucket": "daily", "days": 60}) if BACKEND else {}
         srf = pd.DataFrame(series.get("series", []))
         if not srf.empty:
             srf["t"] = pd.to_datetime(srf["t"], unit="ms", utc=True)
-            st.plotly_chart(px.line(srf, x="t", y="oi_usd", title=f"{sym} Aggregated OI Notional (USD)"), use_container_width=True)
+            st.plotly_chart(
+                px.line(srf, x="t", y="oi_usd", title=f"{sym} Aggregated OI Notional (USD)"),
+                use_container_width=True
+            )
+        elif not rows:
+            if js.get("_error") == "no_backend":
+                st.info("Backend not configured. Set BACKEND_URL in Secrets.")
+            else:
+                st.info("No aggregated OI data yet.")
 
 # ---- Liquidations ----
 with t_liq:
     st.subheader("Live Liquidations Heatmap (Backend buffer from Binance !forceOrder@arr)")
-    sym = st.selectbox("Symbol", symbols, index=0)
-    js = jget(
-        f"{BACKEND}/liq/heatmap", {"symbol": sym, "minutes": st.session_state.get("liq_minutes", 30), "bins": bins}
-    ) if BACKEND else {"x": [], "y": [], "z": []}
-    # fall back to sidebar value if not saved
+    sym = st.selectbox("Symbol", symbols, index=0, key="liq_sym")
+
     if not BACKEND:
         st.info("Backend not configured. Set BACKEND_URL in Secrets.")
-    elif not js.get("x"):
-        st.info("Waiting for liquidation prints (or backend not running yet)...")
     else:
-        ydt = pd.to_datetime(js["y"], unit="ms", utc=True)
-        fig = go.Figure(data=go.Heatmap(z=js["z"], x=js["x"], y=ydt))
-        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), title=f"{sym} – Liq Notional Heatmap")
-        st.plotly_chart(fig, use_container_width=True)
+        # Pull heatmap using the current slider value (previously used session_state by mistake)
+        hm = api_get("/liq/heatmap", {"symbol": sym, "minutes": liq_minutes, "bins": bins})
+
+        # Optional: show basic buffer status if available (won't break if endpoint missing)
+        status = api_get("/liq/status", {"minutes": liq_minutes})
+        if isinstance(status, dict):
+            buf_n = status.get("count") or status.get("n") or status.get("events")
+            if buf_n is not None:
+                st.caption(f"Backend liq buffer (last {liq_minutes}m): {buf_n} events")
+
+        if not isinstance(hm, dict) or not hm.get("x") or not hm.get("y") or not hm.get("z"):
+            # If backend just started, it may take ~30–60s to accumulate prints.
+            err = hm.get("_error") if isinstance(hm, dict) else None
+            if err == "no_backend":
+                st.info("Backend not configured. Set BACKEND_URL in Secrets.")
+            else:
+                st.info("Waiting for liquidation prints (or backend not running yet)...")
+        else:
+            # y comes in ms
+            ydt = pd.to_datetime(hm["y"], unit="ms", utc=True)
+            fig = go.Figure(data=go.Heatmap(z=hm["z"], x=hm["x"], y=ydt))
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), title=f"{sym} – Liq Notional Heatmap")
+            st.plotly_chart(fig, use_container_width=True)
 
 # ---- Overview ----
 with t_over:
