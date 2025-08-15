@@ -1,0 +1,20 @@
+name: Cron Snapshots (Macro + OI)
+
+on:
+  schedule:
+    - cron: '7 * * * *'      # hourly macro snapshot
+    - cron: '*/10 * * * *'   # OI snapshots every 10 minutes
+  workflow_dispatch:
+
+jobs:
+  hit-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call macro snapshot
+        run: |
+          if [ -z "${{ secrets.BACKEND_URL }}" ]; then echo 'Set BACKEND_URL repo secret'; exit 0; fi
+          curl -fsSL "${{ secrets.BACKEND_URL }}/macro/snapshot" -X POST || true
+      - name: Call OI snapshots (BTC & ETH)
+        run: |
+          if [ -z "${{ secrets.BACKEND_URL }}" ]; then exit 0; fi
+          curl -fsSL "${{ secrets.BACKEND_URL }}/agg/snapshot?symbols=BTCUSDT,ETHUSDT" -X POST || true
