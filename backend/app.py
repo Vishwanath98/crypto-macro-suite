@@ -1,31 +1,17 @@
-# backend/app.py
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-from routers import macro, agg, liq, derivs
-
-# ✅ import AFTER standard libs to avoid circulars
+from routers import health, macro, agg, liq
 from services.ws_liq import RUN_WS, start_liq_buffer
+import threading
 
-app = FastAPI(title="Crypto Macro Suite")
+app = FastAPI(title="Crypto Macro Suite Backend")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
+app.include_router(health.router, prefix="")
+app.include_router(macro.router,  prefix="/macro")
+app.include_router(agg.router,    prefix="/agg")
+app.include_router(liq.router,    prefix="/liq")
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-# Routers
-app.include_router(macro.router)
-app.include_router(agg.router)
-app.include_router(liq.router)
-app.include_router(derivs.router)
-
-# 🔌 start the WS buffer only when RUN_WS=1
 @app.on_event("startup")
-def kick_ws():
-    if RUN_WS:
-        start_liq_buffer()
+def _startup():
+    if RUN_WS:  # env RUN_WS defaults to "1" in services/ws_liq.py
+        t = threading.Thread(target=start_liq_buffer, daemon=True)
+        t.start()
