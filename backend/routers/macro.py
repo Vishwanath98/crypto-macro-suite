@@ -11,7 +11,11 @@ from services.storage import conn
 
 router = APIRouter(prefix="/macro", tags=["macro"])
 UTC = timezone.utc
-
+@router.get("/snapshot")
+def macro_snapshot_get():
+    # Reuse the POST handler
+    return macro_snapshot()
+    
 @router.post("/snapshot")
 def macro_snapshot():
     """Store a single snapshot of total/alt/BTC/ETH caps using FREE CoinGecko endpoints (current values).
@@ -58,3 +62,4 @@ def macro_series(bucket: str = "daily", days: int = 180):
         for idx, row in agg.iterrows()
     ]
     return {"bucket": bucket, "series": out}
+
